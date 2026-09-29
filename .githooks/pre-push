@@ -1,0 +1,3 @@
+#!/bin/sh
+# Dedicated repo: Banking Control ships from main.
+exit 0
