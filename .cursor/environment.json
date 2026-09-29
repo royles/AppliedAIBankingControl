@@ -1,0 +1,16 @@
+{
+  "name": "Banking Control Solution",
+  "install": "bash .cursor/install.sh",
+  "terminals": [
+    {
+      "name": "banking-control",
+      "command": "bash scripts/ensure_branch.sh && BANKING_CONTROL_HOST=0.0.0.0 exec python3 4_application/start-app.py"
+    }
+  ],
+  "ports": [
+    {
+      "name": "api",
+      "port": 8080
+    }
+  ]
+}
