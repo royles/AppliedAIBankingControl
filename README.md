@@ -10,6 +10,8 @@
 - [Key Features](#key-features)
 - [Quickstart](#quickstart)
 - [Architecture / Software Components](#architecture--software-components)
+  - [Logical component diagram](#logical-component-diagram)
+  - [Frontend-to-backend event flows](#frontend-to-backend-event-flows)
 - [Target Audience](#target-audience)
 - [Repository Structure](#repository-structure)
 - [Prerequisites](#prerequisites)
@@ -82,14 +84,152 @@ bash .cursor/install.sh              # dependencies + DB seed
 
 ## Architecture / Software Components
 
-```text
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│ frontend/dist   │     │  FastAPI (API)   │     │ SQLite warehouse │
-│ (static UI)     │────▶│  banking_control │────▶│ banking_control  │
-└─────────────────┘     │  + plugins/LLM   │     │ .db + schema.sql │
-                        └────────┬─────────┘     └─────────────────┘
-                                 │
-                    optional: Bedrock / OpenAI-compatible LLM
+### Logical component diagram
+
+Logical layers, major modules, and how they connect at runtime (single Uvicorn worker; optional Cloudera AI packaging uses the same entrypoints).
+
+```mermaid
+flowchart TB
+  subgraph platform["Cloudera AI (optional)"]
+    S1["1_session-install-dependencies"]
+    S2["2_job-init-database"]
+    S3["4_application/start-app.py"]
+    S1 --> S2 --> S3
+  end
+
+  subgraph runtime["ASGI runtime"]
+    UV["Uvicorn"]
+    APP["FastAPI app<br/>banking_control.api.factory:create_app"]
+    S3 --> UV --> APP
+  end
+
+  subgraph presentation["Presentation"]
+    UI["Browser dashboard<br/>frontend/dist SPA"]
+    STATIC["StaticFiles /assets<br/>SPA index fallback"]
+    UI -->|"HTTPS same origin"| STATIC
+    STATIC --> APP
+  end
+
+  subgraph api["HTTP API surface"]
+    CORE["core · health, overview, domains"]
+    DATA["controls · alerts · exceptions<br/>audit · activity-timeline"]
+    TOOLS["tools · catalog invoke"]
+    ASST["assistant · SSE chat"]
+    ADMIN["admin · LLM settings"]
+    APP --> CORE & DATA & TOOLS & ASST & ADMIN
+  end
+
+  subgraph domain["Domain & integration"]
+    DEPS["api/deps · DB sessions"]
+    DBL["db.py · queries & overview cache"]
+    PM["PluginManager<br/>builtins + examples"]
+    REG["ToolRegistry"]
+    ENG["ControlToolEngine<br/>schemas + simulators"]
+    ASSTMOD["assistant/* · stream, tools, rules"]
+    LLM["llm/* · Bedrock & OpenAI-compatible"]
+    CORE & DATA & TOOLS & ASST & ADMIN --> DEPS
+    DEPS --> DBL
+    TOOLS & ASST --> ENG
+    ASST --> ASSTMOD
+    ASSTMOD --> ENG
+    ASSTMOD --> LLM
+    ENG --> PM & REG
+    ADMIN --> LLM
+  end
+
+  subgraph persistence["Persistence"]
+    SQL["data/schema.sql"]
+    DB[("SQLite warehouse<br/>banking_control.db")]
+    SEED["scripts/init_db.py · seed.py"]
+    SEED --> SQL --> DB
+    DBL --> DB
+    LLM -->|"APP_LLM_* config rows"| DB
+  end
+
+  subgraph background["Background (startup)"]
+    WORK["TransactionAlertWorker"]
+    GEN["alert_generator"]
+    APP -->|"on startup"| WORK
+    WORK --> GEN --> DB
+  end
+
+  subgraph external["External (optional)"]
+    BR["Amazon Bedrock"]
+    OAI["OpenAI-compatible endpoint"]
+    LLM -.-> BR & OAI
+  end
+```
+
+### Frontend-to-backend event flows
+
+Typical browser-initiated flows and server-side events that refresh warehouse data without a UI call.
+
+```mermaid
+sequenceDiagram
+  actor User
+  participant UI as Dashboard JS<br/>(app · detail · timeline · assistant)
+  participant API as FastAPI routers
+  participant DB as SQLite
+  participant ENG as ControlToolEngine
+  participant LLM as Bedrock / OpenAI-compatible
+  participant Worker as TransactionAlertWorker
+
+  Note over User,Worker: Shell load
+  User->>UI: Navigate to /
+  UI->>API: GET / · GET /assets/*
+  API-->>UI: index.html · static bundles
+
+  Note over User,DB: boot() — parallel REST reads
+  UI->>API: GET /api/health
+  API->>DB: control counts · LLM config probe
+  par Overview & catalog
+    UI->>API: GET /api/overview
+    UI->>API: GET /api/domains
+    UI->>API: GET /api/controls?filters
+  and Monitoring & oversight
+    UI->>API: GET /api/alerts?min_risk&status
+    UI->>API: GET /api/exceptions
+    UI->>API: GET /api/audit-log
+    UI->>API: GET /api/activity-timeline
+  end
+  API->>DB: SQL / cached APP_OVERVIEW_SNAPSHOT
+  DB-->>API: JSON rows
+  API-->>UI: Render panels
+
+  Note over User,UI: Filters & refresh
+  User->>UI: Search controls · risk slider · Refresh
+  UI->>API: GET /api/controls · /api/alerts · /api/overview?refresh=1
+  API->>DB: filtered queries · refresh_overview_cache
+  API-->>UI: Updated tables & KPI cards
+
+  Note over User,DB: Drill-down & mutations
+  User->>UI: Open row · advance exception
+  UI->>API: GET /api/controls/{id} · /api/alerts/{id} · …
+  UI->>API: PATCH /api/exceptions/{id}
+  API->>DB: read / update status
+  API-->>UI: detail JSON
+  UI->>API: GET /api/overview · /api/audit-log
+  API-->>UI: refreshed metrics & audit trail
+
+  Note over User,LLM: Assistant (SSE)
+  User->>UI: Chat message or starter chip
+  UI->>API: POST /api/assistant/chat/stream
+  API->>DB: session + load_llm_config
+  alt LLM online
+    API->>LLM: streaming messages + tool defs
+    LLM-->>API: tokens / tool_calls
+    API->>ENG: invoke_control_tool · warehouse tools
+    ENG->>DB: live control & simulation data
+    API-->>UI: text/event-stream (answer, actions, tasks)
+  else LLM offline
+    API->>ENG: rules fallback + limited tools
+    API-->>UI: SSE answer (+ configure LLM hint)
+  end
+  UI->>UI: Optional dashboard actions from assistant chips
+
+  Note over Worker,DB: Server-side (no browser)
+  Worker->>DB: expire stale alerts · insert TM alerts
+  Worker->>DB: refresh_overview_cache
 ```
 
 - **UI** — Prebuilt static assets under `frontend/dist/` served by FastAPI.
